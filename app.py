@@ -1,253 +1,330 @@
 import streamlit as st
-from pdf2image import convert_from_bytes
-from PIL import Image
-import numpy as np
+import ezdxf
 import pandas as pd
-import cv2
 from io import BytesIO
-from sklearn.cluster import KMeans
+import tempfile
+import os
 
+from shapely.geometry import LineString, Polygon, box
+from shapely.ops import polygonize, unary_union
 
-st.set_page_config(page_title="Formations en déblai", page_icon="📊")
-st.title("📊 Pourcentage des formations en déblai")
-st.write("Analyse par pixels au-dessus de la ligne rouge.")
 
+st.set_page_config(page_title="Déblai DXF", page_icon="📐")
 
-def detect_red_line(image_rgb):
-    img = np.array(image_rgb)
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+st.title("📐 Analyse déblai depuis AutoCAD DXF")
+st.write("Ligne projet bleue + formations AutoCAD → pourcentages en déblai.")
 
-    mask1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
-    mask2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
 
-    red_mask = cv2.bitwise_or(mask1, mask2)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+def get_color_name(entity):
+    color = entity.dxf.color
 
-    return red_mask
+    if color == 5:
+        return "blue"
+    if color == 1:
+        return "red"
+    if color == 3:
+        return "green"
+    if color == 2:
+        return "yellow"
+    return str(color)
 
 
-def get_red_line_y(red_mask):
-    h, w = red_mask.shape
-    line_y = np.full(w, -1, dtype=int)
+def entity_to_linestring(entity):
+    try:
+        if entity.dxftype() == "LWPOLYLINE":
+            pts = [(p[0], p[1]) for p in entity.get_points()]
+            if len(pts) >= 2:
+                return LineString(pts)
 
-    for x in range(w):
-        ys = np.where(red_mask[:, x] > 0)[0]
-        if len(ys) > 0:
-            line_y[x] = int(np.median(ys))
+        if entity.dxftype() == "POLYLINE":
+            pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+            if len(pts) >= 2:
+                return LineString(pts)
 
-    valid = line_y >= 0
+        if entity.dxftype() == "LINE":
+            start = entity.dxf.start
+            end = entity.dxf.end
+            return LineString([(start.x, start.y), (end.x, end.y)])
 
-    if valid.sum() < 10:
-        return line_y
+    except Exception:
+        return None
 
-    return np.interp(
-        np.arange(w),
-        np.where(valid)[0],
-        line_y[valid]
-    ).astype(int)
+    return None
 
 
-def create_deblai_mask(line_y, height):
-    mask = np.zeros((height, len(line_y)), dtype=np.uint8)
+def hatch_to_polygon(entity):
+    polygons = []
 
-    for x, y in enumerate(line_y):
-        if y > 0:
-            mask[:y, x] = 255
+    try:
+        for path in entity.paths:
+            pts = []
 
-    return mask
+            for edge in path.edges:
+                if edge.EDGE_TYPE == "LineEdge":
+                    pts.append((edge.start.x, edge.start.y))
 
+            if len(pts) >= 3:
+                poly = Polygon(pts)
+                if poly.is_valid and poly.area > 0:
+                    polygons.append(poly)
 
-def remove_white_black_red_pixels(image_rgb, mask):
-    img = np.array(image_rgb)
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    except Exception:
+        pass
 
-    area = mask > 0
+    if not polygons:
+        return None
 
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    hue = hsv[:, :, 0]
+    return unary_union(polygons)
 
-    not_white = value < 245
-    not_black = value > 40
-    colorful = saturation > 25
 
-    not_red = ~(
-        ((hue <= 10) | (hue >= 170)) &
-        (saturation > 60) &
-        (value > 50)
-    )
+def closed_polyline_to_polygon(entity):
+    try:
+        if entity.dxftype() == "LWPOLYLINE" and entity.closed:
+            pts = [(p[0], p[1]) for p in entity.get_points()]
+            if len(pts) >= 3:
+                poly = Polygon(pts)
+                if poly.is_valid and poly.area > 0:
+                    return poly
 
-    valid = area & not_white & not_black & colorful & not_red
+        if entity.dxftype() == "POLYLINE" and entity.is_closed:
+            pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+            if len(pts) >= 3:
+                poly = Polygon(pts)
+                if poly.is_valid and poly.area > 0:
+                    return poly
 
-    return valid
+    except Exception:
+        return None
 
+    return None
 
-def detect_dominant_colors(image_rgb, deblai_mask, color_count):
-    img = np.array(image_rgb)
-    valid = remove_white_black_red_pixels(image_rgb, deblai_mask)
 
-    pixels = img[valid]
+def find_project_line(msp, project_layer, use_blue=True):
+    candidates = []
 
-    if len(pixels) < 100:
-        return []
+    for entity in msp:
+        if entity.dxftype() not in ["LINE", "LWPOLYLINE", "POLYLINE"]:
+            continue
 
-    if len(pixels) > 50000:
-        idx = np.random.choice(len(pixels), 50000, replace=False)
-        pixels = pixels[idx]
+        layer_match = entity.dxf.layer.lower() == project_layer.lower()
+        blue_match = use_blue and entity.dxf.color == 5
 
-    kmeans = KMeans(n_clusters=color_count, random_state=42, n_init=10)
-    kmeans.fit(pixels)
+        if layer_match or blue_match:
+            line = entity_to_linestring(entity)
+            if line and line.length > 0:
+                candidates.append(line)
 
-    colors = kmeans.cluster_centers_.astype(int)
+    if not candidates:
+        return None
 
-    return [tuple(map(int, color)) for color in colors]
+    return max(candidates, key=lambda g: g.length)
 
 
-def color_mask(image_rgb, target_rgb, tolerance, deblai_mask):
-    img = np.array(image_rgb).astype(np.int16)
-    target = np.array(target_rgb).astype(np.int16)
+def find_tn_line(msp, tn_layer):
+    candidates = []
 
-    distance = np.sqrt(np.sum((img - target) ** 2, axis=2))
+    for entity in msp:
+        if entity.dxftype() not in ["LINE", "LWPOLYLINE", "POLYLINE"]:
+            continue
 
-    mask = (distance <= tolerance) & (deblai_mask > 0)
+        if entity.dxf.layer.lower() == tn_layer.lower():
+            line = entity_to_linestring(entity)
+            if line and line.length > 0:
+                candidates.append(line)
 
-    return mask
+    if not candidates:
+        return None
 
+    return max(candidates, key=lambda g: g.length)
 
-def analyze(image_rgb, colors_info, tolerance):
-    img = np.array(image_rgb)
-    h, w = img.shape[:2]
 
-    red_mask = detect_red_line(image_rgb)
-    line_y = get_red_line_y(red_mask)
-    deblai_mask = create_deblai_mask(line_y, h)
+def line_y_at_x(line, x):
+    coords = list(line.coords)
 
-    results = []
-    masks = {}
-    total_pixels = 0
+    for i in range(len(coords) - 1):
+        x1, y1 = coords[i]
+        x2, y2 = coords[i + 1]
 
-    for info in colors_info:
-        name = info["name"]
-        color = info["color"]
+        if min(x1, x2) <= x <= max(x1, x2) and x1 != x2:
+            t = (x - x1) / (x2 - x1)
+            return y1 + t * (y2 - y1)
 
-        mask = color_mask(image_rgb, color, tolerance, deblai_mask)
-        pixels = int(mask.sum())
+    return None
 
-        masks[name] = mask
-        total_pixels += pixels
 
-        results.append({
-            "Formation": name,
-            "Couleur RGB": str(color),
-            "Pixels": pixels
-        })
+def build_deblai_polygon(tn_line, project_line, samples=1000):
+    min_x = max(tn_line.bounds[0], project_line.bounds[0])
+    max_x = min(tn_line.bounds[2], project_line.bounds[2])
 
-    for row in results:
-        row["Pourcentage (%)"] = round(
-            row["Pixels"] / total_pixels * 100,
-            2
-        ) if total_pixels else 0
+    if min_x >= max_x:
+        return None
 
-    return pd.DataFrame(results), deblai_mask, masks
+    top_points = []
+    bottom_points = []
 
+    for i in range(samples + 1):
+        x = min_x + (max_x - min_x) * i / samples
 
-def make_overlay(image_rgb, deblai_mask, masks):
-    img = np.array(image_rgb).copy()
-    overlay = img.copy()
+        y_tn = line_y_at_x(tn_line, x)
+        y_project = line_y_at_x(project_line, x)
 
-    area = deblai_mask > 0
-    overlay[area] = (overlay[area] * 0.65 + np.array([255, 255, 0]) * 0.35).astype(np.uint8)
+        if y_tn is None or y_project is None:
+            continue
 
-    for mask in masks.values():
-        overlay[mask] = (overlay[mask] * 0.35 + np.array([0, 255, 0]) * 0.65).astype(np.uint8)
+        if y_tn > y_project:
+            top_points.append((x, y_tn))
+            bottom_points.append((x, y_project))
 
-    return Image.fromarray(overlay)
+    if len(top_points) < 3:
+        return None
 
+    coords = top_points + bottom_points[::-1]
+    poly = Polygon(coords)
 
-uploaded_pdf = st.file_uploader("Importer le PDF du profil", type=["pdf"])
+    if not poly.is_valid:
+        poly = poly.buffer(0)
 
-st.sidebar.header("⚙️ Paramètres")
-dpi = st.sidebar.slider("DPI", 100, 300, 200, 50)
-color_count = st.sidebar.slider("Nombre de couleurs/formations à détecter", 2, 15, 6)
-tolerance = st.sidebar.slider("Tolérance couleur", 5, 120, 35, 5)
+    return poly
 
-if uploaded_pdf is not None:
-    pdf_bytes = uploaded_pdf.read()
 
-    pages = convert_from_bytes(pdf_bytes, dpi=dpi)
+def extract_formations(msp, ignored_layers):
+    formations = []
 
-    page_number = st.number_input(
-        "Page à analyser",
-        min_value=1,
-        max_value=len(pages),
-        value=1
-    )
+    for entity in msp:
+        layer = entity.dxf.layer
 
-    image = pages[page_number - 1].convert("RGB")
+        if layer.lower() in [x.lower() for x in ignored_layers]:
+            continue
 
-    st.image(image, caption=f"Page {page_number}", use_container_width=True)
+        poly = None
 
-    red_mask = detect_red_line(image)
-    line_y = get_red_line_y(red_mask)
-    deblai_mask = create_deblai_mask(line_y, np.array(image).shape[0])
+        if entity.dxftype() == "HATCH":
+            poly = hatch_to_polygon(entity)
 
-    if st.button("Détecter les couleurs du PDF"):
-        colors = detect_dominant_colors(image, deblai_mask, color_count)
-        st.session_state["colors"] = colors
+        elif entity.dxftype() in ["LWPOLYLINE", "POLYLINE"]:
+            poly = closed_polyline_to_polygon(entity)
 
-    if "colors" in st.session_state:
-        st.subheader("Couleurs détectées")
-
-        colors_info = []
-
-        for i, color in enumerate(st.session_state["colors"], start=1):
-            col1, col2 = st.columns([1, 4])
-
-            with col1:
-                color_img = np.zeros((60, 120, 3), dtype=np.uint8)
-                color_img[:, :] = color
-                st.image(color_img)
-
-            with col2:
-                name = st.text_input(
-                    f"Nom de la formation couleur {i}",
-                    value=f"Formation_{i}"
-                )
-
-            colors_info.append({
-                "name": name,
-                "color": color
+        if poly is not None and poly.area > 0:
+            formations.append({
+                "formation": layer,
+                "geometry": poly,
+                "color": get_color_name(entity)
             })
 
-        if st.button("Calculer les pourcentages"):
-            df, deblai_mask, masks = analyze(
-                image,
-                colors_info,
-                tolerance
-            )
+    return formations
 
-            st.subheader("Résultats")
+
+def analyze_dxf(dxf_path, tn_layer, project_layer, use_blue_project):
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    project_line = find_project_line(
+        msp,
+        project_layer=project_layer,
+        use_blue=use_blue_project
+    )
+
+    tn_line = find_tn_line(
+        msp,
+        tn_layer=tn_layer
+    )
+
+    if project_line is None:
+        raise ValueError("Ligne projet introuvable. Vérifie le layer ou la couleur bleue.")
+
+    if tn_line is None:
+        raise ValueError("Ligne TN introuvable. Vérifie le nom du layer TN.")
+
+    deblai_poly = build_deblai_polygon(tn_line, project_line)
+
+    if deblai_poly is None or deblai_poly.area == 0:
+        raise ValueError("Aucune zone en déblai détectée : TN n'est pas au-dessus de la ligne projet.")
+
+    formations = extract_formations(
+        msp,
+        ignored_layers=[tn_layer, project_layer]
+    )
+
+    rows = []
+    total_area = 0
+
+    for f in formations:
+        inter = f["geometry"].intersection(deblai_poly)
+
+        if not inter.is_empty and inter.area > 0:
+            area = inter.area
+            total_area += area
+
+            rows.append({
+                "Formation": f["formation"],
+                "Couleur": f["color"],
+                "Surface en déblai": area
+            })
+
+    if not rows:
+        raise ValueError("Aucune formation/hachure trouvée dans la zone de déblai.")
+
+    df = pd.DataFrame(rows)
+
+    df = df.groupby(["Formation", "Couleur"], as_index=False)["Surface en déblai"].sum()
+
+    df["Pourcentage (%)"] = round(
+        df["Surface en déblai"] / df["Surface en déblai"].sum() * 100,
+        2
+    )
+
+    return df, deblai_poly.area
+
+
+uploaded_file = st.file_uploader("Importer fichier AutoCAD DXF", type=["dxf"])
+
+st.sidebar.header("Paramètres AutoCAD")
+
+tn_layer = st.sidebar.text_input("Nom du layer TN", value="TN")
+project_layer = st.sidebar.text_input("Nom du layer ligne projet", value="PROJET")
+
+use_blue_project = st.sidebar.checkbox(
+    "Détecter aussi la ligne projet bleue",
+    value=True
+)
+
+if uploaded_file is not None:
+    if st.button("Calculer les pourcentages"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+            tmp.write(uploaded_file.read())
+            dxf_path = tmp.name
+
+        try:
+            with st.spinner("Analyse du DXF..."):
+                df, deblai_area = analyze_dxf(
+                    dxf_path,
+                    tn_layer,
+                    project_layer,
+                    use_blue_project
+                )
+
+            st.success("Analyse terminée ✔️")
+
+            st.write(f"Surface totale déblai détectée : `{deblai_area:.2f}`")
             st.dataframe(df)
-
-            overlay = make_overlay(image, deblai_mask, masks)
-
-            st.subheader("Contrôle visuel")
-            st.image(
-                overlay,
-                caption="Jaune = zone déblai / Vert = pixels classés",
-                use_container_width=True
-            )
 
             output = BytesIO()
 
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name="Pourcentages", index=False)
+                df.to_excel(writer, sheet_name="Formations_deblai", index=False)
 
             output.seek(0)
 
             st.download_button(
                 label="📥 Télécharger Excel",
                 data=output,
-                file_name="pourcentage_formations_deblai.xlsx",
+                file_name="formations_deblai.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
+        except Exception as e:
+            st.error(str(e))
+
+        finally:
+            if os.path.exists(dxf_path):
+                os.remove(dxf_path)
