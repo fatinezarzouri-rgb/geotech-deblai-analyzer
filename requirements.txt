@@ -1,6 +1,6 @@
 streamlit
 pillow
-opencv-python-headless
 numpy
 pandas
 openpyxl
+scikit-learn
