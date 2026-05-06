@@ -1,5 +1,7 @@
 streamlit
-ezdxf
-shapely
+pdf2image
+pillow
+opencv-python-headless
+numpy
 pandas
 openpyxl
