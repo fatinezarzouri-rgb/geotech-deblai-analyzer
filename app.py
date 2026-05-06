@@ -1,187 +1,167 @@
 import streamlit as st
-import ezdxf
+import numpy as np
 import pandas as pd
+import cv2
+from PIL import Image
+from pdf2image import convert_from_bytes
 from io import BytesIO
-import tempfile
-import os
-from shapely.geometry import Polygon
-from shapely.ops import unary_union
 
 
-st.set_page_config(page_title="Pourcentage formations DXF", page_icon="📐")
-st.title("📐 Pourcentage des formations distinctes")
-st.write("Importer un DXF déjà découpé dans la zone de déblai.")
+st.set_page_config(page_title="Formations en déblai", page_icon="📊")
+st.title("📊 Pourcentage des formations en déblai")
 
 
-def entity_color(e):
-    try:
-        if e.dxf.hasattr("true_color") and e.dxf.true_color:
-            tc = e.dxf.true_color
-            r = (tc >> 16) & 255
-            g = (tc >> 8) & 255
-            b = tc & 255
-            return f"RGB({r},{g},{b})"
-    except Exception:
-        pass
+def load_image(uploaded_file):
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
 
-    try:
-        return f"ACI({int(e.dxf.color)})"
-    except Exception:
-        return "UNKNOWN"
+    if name.endswith(".pdf"):
+        pages = convert_from_bytes(data, dpi=200)
+        return pages[0].convert("RGB")
+
+    return Image.open(BytesIO(data)).convert("RGB")
 
 
-def get_entities(msp):
-    entities = []
+def detect_blue_line(img):
+    arr = np.array(img)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
 
-    for e in msp:
-        if e.dxftype() == "INSERT":
-            try:
-                entities.extend(list(e.virtual_entities()))
-            except Exception:
-                pass
-        else:
-            entities.append(e)
+    lower = np.array([95, 70, 40])
+    upper = np.array([135, 255, 255])
 
-    return entities
+    return cv2.inRange(hsv, lower, upper)
 
 
-def hatch_to_polygon(e):
-    polygons = []
+def detect_green_tn(img):
+    arr = np.array(img)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
 
-    try:
-        for path in e.paths:
-            pts = []
+    lower = np.array([40, 60, 40])
+    upper = np.array([85, 255, 255])
 
-            if hasattr(path, "vertices"):
-                pts = [(p[0], p[1]) for p in path.vertices]
-
-            elif hasattr(path, "edges"):
-                for edge in path.edges:
-                    if edge.EDGE_TYPE == "LineEdge":
-                        pts.append((edge.start.x, edge.start.y))
-
-            if len(pts) >= 3:
-                poly = Polygon(pts).buffer(0)
-
-                if poly.is_valid and poly.area > 0:
-                    polygons.append(poly)
-
-    except Exception:
-        pass
-
-    if not polygons:
-        return None
-
-    return unary_union(polygons)
+    return cv2.inRange(hsv, lower, upper)
 
 
-def closed_polyline_to_polygon(e):
-    try:
-        if e.dxftype() == "LWPOLYLINE" and e.closed:
-            pts = [(p[0], p[1]) for p in e.get_points()]
-            return Polygon(pts).buffer(0)
+def line_y_by_x(mask):
+    h, w = mask.shape
+    ys_line = np.full(w, -1, dtype=int)
 
-        if e.dxftype() == "POLYLINE" and e.is_closed:
-            pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
-            return Polygon(pts).buffer(0)
+    for x in range(w):
+        ys = np.where(mask[:, x] > 0)[0]
+        if len(ys) > 0:
+            ys_line[x] = int(np.median(ys))
 
-    except Exception:
-        return None
+    valid = ys_line >= 0
 
-    return None
+    if valid.sum() < 20:
+        return ys_line
+
+    xs = np.where(valid)[0]
+    ys = ys_line[valid]
+
+    return np.interp(np.arange(w), xs, ys).astype(int)
 
 
-def extract_formations(dxf_path, group_by):
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
-    entities = get_entities(msp)
+def build_deblai_mask(img):
+    h, w = np.array(img).shape[:2]
+
+    blue = detect_blue_line(img)
+    green = detect_green_tn(img)
+
+    y_blue = line_y_by_x(blue)
+    y_green = line_y_by_x(green)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    for x in range(w):
+        yb = y_blue[x]
+        yg = y_green[x]
+
+        if yb > 0 and yg > 0 and yg < yb:
+            mask[yg:yb, x] = 255
+
+    return mask
+
+
+def classify_formations(img, deblai_mask):
+    arr = np.array(img)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+
+    area = deblai_mask > 0
+
+    masks = {
+        "Les basaltes": area & (h >= 10) & (h <= 30) & (s > 80) & (v > 40) & (v < 210),
+        "Les grès": area & (h >= 25) & (h <= 38) & (s > 80) & (v > 120),
+        "Les argiles, limons et tufs": area & (((h <= 8) | (h >= 170)) & (s > 80) & (v > 60)),
+        "Les marnes et argiles marneuses": area & (h >= 135) & (h <= 165) & (s > 60) & (v > 100),
+        "Les schistes sains": area & (s < 45) & (v > 60) & (v < 190),
+    }
 
     rows = []
+    total = 0
 
-    for e in entities:
-        poly = None
-
-        if e.dxftype() == "HATCH":
-            poly = hatch_to_polygon(e)
-
-        elif e.dxftype() in ["LWPOLYLINE", "POLYLINE"]:
-            poly = closed_polyline_to_polygon(e)
-
-        if poly is None or poly.area <= 0:
-            continue
-
-        layer = str(e.dxf.layer)
-        color = entity_color(e)
-
-        if group_by == "Couleur":
-            formation = color
-        elif group_by == "Layer":
-            formation = layer
-        else:
-            formation = f"{layer} | {color}"
-
-        rows.append({
-            "Formation détectée": formation,
-            "Layer": layer,
-            "Couleur": color,
-            "Surface": poly.area
-        })
-
-    if not rows:
-        raise ValueError("Aucune hachure ou polygone fermé détecté.")
+    for name, mask in masks.items():
+        pixels = int(mask.sum())
+        total += pixels
+        rows.append({"Formation": name, "Pixels": pixels})
 
     df = pd.DataFrame(rows)
 
-    df = df.groupby(
-        ["Formation détectée"],
-        as_index=False
-    )["Surface"].sum()
-
-    total = df["Surface"].sum()
-
-    df["Pourcentage (%)"] = (
-        df["Surface"] / total * 100
-    ).round(2)
+    df["Pourcentage (%)"] = df["Pixels"].apply(
+        lambda x: round(x / total * 100, 2) if total else 0
+    )
 
     return df.sort_values("Pourcentage (%)", ascending=False)
 
 
-uploaded = st.file_uploader("Importer le DXF découpé", type=["dxf"])
+def make_overlay(img, deblai_mask):
+    arr = np.array(img).copy()
+    overlay = arr.copy()
 
-group_by = st.selectbox(
-    "Grouper les formations par",
-    ["Couleur", "Layer", "Layer + Couleur"]
-)
+    area = deblai_mask > 0
+    overlay[area] = (overlay[area] * 0.6 + np.array([255, 255, 0]) * 0.4).astype(np.uint8)
+
+    return Image.fromarray(overlay)
+
+
+uploaded = st.file_uploader("Importer image ou PDF du profil", type=["png", "jpg", "jpeg", "pdf"])
 
 if uploaded:
-    if st.button("Calculer les pourcentages"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
-            tmp.write(uploaded.read())
-            path = tmp.name
+    img = load_image(uploaded)
 
-        try:
-            df = extract_formations(path, group_by)
+    st.image(img, caption="Profil importé", use_container_width=True)
+
+    if st.button("Calculer les pourcentages"):
+        deblai_mask = build_deblai_mask(img)
+
+        if deblai_mask.sum() == 0:
+            st.error("Zone de déblai non détectée. Vérifie que TN est vert et ligne projet bleue.")
+        else:
+            df = classify_formations(img, deblai_mask)
 
             st.success("Calcul terminé ✔️")
             st.dataframe(df)
 
+            st.image(
+                make_overlay(img, deblai_mask),
+                caption="Zone analysée : entre TN vert et ligne bleue",
+                use_container_width=True
+            )
+
             output = BytesIO()
 
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name="Pourcentages", index=False)
+                df.to_excel(writer, sheet_name="Formations_deblai", index=False)
 
             output.seek(0)
 
             st.download_button(
                 "📥 Télécharger Excel",
                 data=output,
-                file_name="pourcentage_formations.xlsx",
+                file_name="pourcentage_formations_deblai.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-
-        except Exception as e:
-            st.error(str(e))
-
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
