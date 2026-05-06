@@ -4,40 +4,65 @@ import pandas as pd
 from io import BytesIO
 import tempfile
 import os
-
 from shapely.geometry import LineString, Polygon
 from shapely.ops import unary_union
 
 
-st.set_page_config(page_title="Analyse déblai DXF", page_icon="📐")
-st.title("📐 Analyse des formations en déblai depuis DXF")
-
 BLUE = 5
 GREEN = 3
 
+COLOR_TO_FORMATION = {
+    30: "Les basaltes",
+    34: "Les basaltes",
+    2: "Les grès",
+    50: "Les grès",
+    1: "Les argiles, les limons et les tufs",
+    6: "Les marnes et argiles marneuses",
+    8: "Les schistes sains",
+    9: "Les schistes altérés",
+    4: "Les conglomérats",
+}
 
-def entity_color(entity):
-    return int(entity.dxf.color) if entity.dxf.hasattr("color") else 256
+st.set_page_config(page_title="Déblai formations DXF", page_icon="📐")
+st.title("📐 Calcul des formations en déblai depuis DXF")
 
 
-def entity_layer(entity):
-    return str(entity.dxf.layer)
-
-
-def entity_to_line(entity):
+def entity_color(e):
     try:
-        if entity.dxftype() == "LINE":
-            s = entity.dxf.start
-            e = entity.dxf.end
-            return LineString([(s.x, s.y), (e.x, e.y)])
+        return int(e.dxf.color)
+    except Exception:
+        return 256
 
-        if entity.dxftype() == "LWPOLYLINE":
-            pts = [(p[0], p[1]) for p in entity.get_points()]
+
+def get_all_entities(msp):
+    entities = []
+
+    for e in msp:
+        if e.dxftype() == "INSERT":
+            try:
+                for ve in e.virtual_entities():
+                    entities.append(ve)
+            except Exception:
+                pass
+        else:
+            entities.append(e)
+
+    return entities
+
+
+def entity_to_line(e):
+    try:
+        if e.dxftype() == "LINE":
+            s, p = e.dxf.start, e.dxf.end
+            return LineString([(s.x, s.y), (p.x, p.y)])
+
+        if e.dxftype() == "LWPOLYLINE":
+            pts = [(p[0], p[1]) for p in e.get_points()]
             if len(pts) >= 2:
                 return LineString(pts)
 
-        if entity.dxftype() == "POLYLINE":
-            pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+        if e.dxftype() == "POLYLINE":
+            pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
             if len(pts) >= 2:
                 return LineString(pts)
 
@@ -47,17 +72,17 @@ def entity_to_line(entity):
     return None
 
 
-def closed_polyline_to_polygon(entity):
+def closed_polyline_to_polygon(e):
     try:
-        if entity.dxftype() == "LWPOLYLINE" and entity.closed:
-            pts = [(p[0], p[1]) for p in entity.get_points()]
+        if e.dxftype() == "LWPOLYLINE" and e.closed:
+            pts = [(p[0], p[1]) for p in e.get_points()]
             poly = Polygon(pts)
-            return poly.buffer(0) if poly.is_valid else None
+            return poly.buffer(0)
 
-        if entity.dxftype() == "POLYLINE" and entity.is_closed:
-            pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+        if e.dxftype() == "POLYLINE" and e.is_closed:
+            pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
             poly = Polygon(pts)
-            return poly.buffer(0) if poly.is_valid else None
+            return poly.buffer(0)
 
     except Exception:
         return None
@@ -65,11 +90,11 @@ def closed_polyline_to_polygon(entity):
     return None
 
 
-def hatch_to_polygon(entity):
-    polygons = []
+def hatch_to_polygon(e):
+    polys = []
 
     try:
-        for path in entity.paths:
+        for path in e.paths:
             pts = []
 
             if hasattr(path, "vertices"):
@@ -81,39 +106,38 @@ def hatch_to_polygon(entity):
                         pts.append((edge.start.x, edge.start.y))
 
             if len(pts) >= 3:
-                poly = Polygon(pts)
-                if poly.is_valid and poly.area > 0:
-                    polygons.append(poly.buffer(0))
+                poly = Polygon(pts).buffer(0)
+                if poly.area > 0:
+                    polys.append(poly)
 
     except Exception:
         pass
 
-    if not polygons:
+    if not polys:
         return None
 
-    return unary_union(polygons)
+    return unary_union(polys)
 
 
-def find_longest_line_by_color(msp, color):
+def find_longest_line_by_color(entities, color):
     lines = []
 
-    for e in msp:
+    for e in entities:
         if e.dxftype() not in ["LINE", "LWPOLYLINE", "POLYLINE"]:
             continue
 
         if entity_color(e) == color:
             line = entity_to_line(e)
-
             if line is not None and line.length > 0:
                 lines.append(line)
 
     if not lines:
         return None
 
-    return max(lines, key=lambda g: g.length)
+    return max(lines, key=lambda x: x.length)
 
 
-def line_y_at_x(line, x):
+def y_at_x(line, x):
     coords = list(line.coords)
 
     for i in range(len(coords) - 1):
@@ -130,47 +154,43 @@ def line_y_at_x(line, x):
     return None
 
 
-def build_deblai_polygon(tn_line, project_line, samples=1500):
-    min_x = max(tn_line.bounds[0], project_line.bounds[0])
-    max_x = min(tn_line.bounds[2], project_line.bounds[2])
-
-    if min_x >= max_x:
-        return None
+def build_deblai_polygon(tn, projet, samples=2000):
+    min_x = max(tn.bounds[0], projet.bounds[0])
+    max_x = min(tn.bounds[2], projet.bounds[2])
 
     top = []
     bottom = []
 
     for i in range(samples + 1):
         x = min_x + (max_x - min_x) * i / samples
+        y_tn = y_at_x(tn, x)
+        y_pr = y_at_x(projet, x)
 
-        y_tn = line_y_at_x(tn_line, x)
-        y_project = line_y_at_x(project_line, x)
-
-        if y_tn is None or y_project is None:
+        if y_tn is None or y_pr is None:
             continue
 
-        if y_tn > y_project:
+        if y_tn > y_pr:
             top.append((x, y_tn))
-            bottom.append((x, y_project))
+            bottom.append((x, y_pr))
 
     if len(top) < 3:
         return None
 
-    poly = Polygon(top + bottom[::-1])
-
-    if not poly.is_valid:
-        poly = poly.buffer(0)
-
-    return poly
+    return Polygon(top + bottom[::-1]).buffer(0)
 
 
-def extract_formations(msp):
+def extract_formation_polygons(entities):
     formations = []
 
-    for e in msp:
+    for e in entities:
         color = entity_color(e)
 
-        if color in [BLUE, GREEN]:
+        if color in [BLUE, GREEN, 7, 256]:
+            continue
+
+        name = COLOR_TO_FORMATION.get(color)
+
+        if not name:
             continue
 
         poly = None
@@ -183,8 +203,8 @@ def extract_formations(msp):
 
         if poly is not None and poly.area > 0:
             formations.append({
-                "formation": entity_layer(e),
-                "color": color,
+                "Formation": name,
+                "Couleur AutoCAD": color,
                 "geometry": poly
             })
 
@@ -194,25 +214,23 @@ def extract_formations(msp):
 def analyze_dxf(path):
     doc = ezdxf.readfile(path)
     msp = doc.modelspace()
+    entities = get_all_entities(msp)
 
-    project_line = find_longest_line_by_color(msp, BLUE)
-    tn_line = find_longest_line_by_color(msp, GREEN)
+    projet = find_longest_line_by_color(entities, BLUE)
+    tn = find_longest_line_by_color(entities, GREEN)
 
-    if project_line is None:
+    if projet is None:
         raise ValueError("Ligne projet bleue introuvable.")
 
-    if tn_line is None:
+    if tn is None:
         raise ValueError("Terrain naturel vert introuvable.")
 
-    deblai = build_deblai_polygon(tn_line, project_line)
+    deblai = build_deblai_polygon(tn, projet)
 
     if deblai is None or deblai.area <= 0:
         raise ValueError("Aucune zone en déblai détectée.")
 
-    formations = extract_formations(msp)
-
-    if not formations:
-        raise ValueError("Aucune formation/hachure détectée.")
+    formations = extract_formation_polygons(entities)
 
     rows = []
 
@@ -221,13 +239,13 @@ def analyze_dxf(path):
 
         if not inter.is_empty and inter.area > 0:
             rows.append({
-                "Formation": f["formation"],
-                "Couleur AutoCAD": f["color"],
+                "Formation": f["Formation"],
+                "Couleur AutoCAD": f["Couleur AutoCAD"],
                 "Surface en déblai": inter.area
             })
 
     if not rows:
-        raise ValueError("Aucune formation dans la zone de déblai.")
+        raise ValueError("Aucune formation détectée dans la zone de déblai.")
 
     df = pd.DataFrame(rows)
 
@@ -245,38 +263,32 @@ def analyze_dxf(path):
     return df, deblai.area
 
 
-uploaded = st.file_uploader("Importer fichier DXF", type=["dxf"])
+uploaded = st.file_uploader("Importer le fichier DXF / XREF exporté", type=["dxf"])
 
-if uploaded is not None:
-    if st.button("Calculer"):
+if uploaded:
+    if st.button("Calculer les pourcentages"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
             tmp.write(uploaded.read())
             path = tmp.name
 
         try:
-            with st.spinner("Analyse du fichier DXF..."):
-                df, total_deblai = analyze_dxf(path)
+            df, total = analyze_dxf(path)
 
             st.success("Calcul terminé ✔️")
-            st.write(f"Surface totale déblai : `{total_deblai:.2f}`")
-
+            st.write(f"Surface totale en déblai : `{total:.2f}`")
             st.dataframe(df)
 
             output = BytesIO()
 
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(
-                    writer,
-                    sheet_name="Formations_deblai",
-                    index=False
-                )
+                df.to_excel(writer, sheet_name="Formations_deblai", index=False)
 
             output.seek(0)
 
             st.download_button(
                 "📥 Télécharger Excel",
-                output,
-                file_name="formations_deblai.xlsx",
+                data=output,
+                file_name="pourcentage_formations_deblai.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
