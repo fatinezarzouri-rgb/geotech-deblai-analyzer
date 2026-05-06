@@ -1,174 +1,122 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import cv2
 from PIL import Image
 from io import BytesIO
-
+from sklearn.cluster import KMeans
 
 st.set_page_config(page_title="Pourcentage formations", page_icon="📊")
-st.title("📊 Pourcentage des formations dans le déblai")
+st.title("📊 Calcul des pourcentages des formations depuis une image")
 
+uploaded = st.file_uploader("Importer l’image découpée des formations", type=["png", "jpg", "jpeg"])
 
-def load_image(file):
-    return Image.open(file).convert("RGB")
+def crop_image(img, x1, x2, y1, y2):
+    return img.crop((x1, y1, x2, y2))
 
+def rgb_distance(a, b):
+    return np.sqrt(np.sum((a - b) ** 2, axis=2))
 
-def classify_pixels(img):
-    arr = np.array(img)
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+def get_dominant_colors(img, n_colors):
+    arr = np.array(img.convert("RGB"))
+    pixels = arr.reshape(-1, 3)
 
-    h = hsv[:, :, 0]
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
+    # enlever fond sombre, blanc, gris très faible
+    brightness = pixels.mean(axis=1)
+    saturation = pixels.max(axis=1) - pixels.min(axis=1)
+    keep = (brightness > 35) & (brightness < 245) & (saturation > 20)
 
-    # ignorer fond sombre, blanc, traits fins
-    valid = (v > 40) & (s > 40)
+    pixels = pixels[keep]
 
-    # ignorer bleu ligne projet
-    blue = (h >= 95) & (h <= 135) & (s > 60)
+    if len(pixels) > 60000:
+        idx = np.random.choice(len(pixels), 60000, replace=False)
+        pixels = pixels[idx]
 
-    # ignorer vert TN
-    green = (h >= 40) & (h <= 90) & (s > 60)
+    model = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
+    model.fit(pixels)
 
-    valid = valid & ~blue & ~green
+    return model.cluster_centers_.astype(int)
 
-    masks = {}
-
-    # Marron = basaltes
-    masks["Basaltes"] = (
-        valid &
-        (h >= 5) & (h <= 25) &
-        (s > 80) &
-        (v > 45) & (v < 210)
-    )
-
-    # Jaune = grès
-    masks["Grès"] = (
-        valid &
-        (h >= 22) & (h <= 38) &
-        (s > 80) &
-        (v > 120)
-    )
-
-    # Rose = marnes
-    masks["Marnes et argiles marneuses"] = (
-        valid &
-        (h >= 135) & (h <= 165) &
-        (s > 50) &
-        (v > 90)
-    )
-
-    # Gris = schistes sains
-    masks["Schistes sains"] = (
-        (v > 60) & (v < 190) &
-        (s < 45)
-    )
-
-    # Rouge hachuré = argiles / limons / tufs
-    red_lines = (
-        valid &
-        (((h <= 8) | (h >= 170)) &
-        (s > 70) &
-        (v > 50))
-    )
-
-    # épaissir les hachures rouges pour représenter la zone hachurée
-    red_zone = cv2.dilate(
-        red_lines.astype(np.uint8),
-        np.ones((11, 11), np.uint8),
-        iterations=2
-    ).astype(bool)
-
-    red_zone = red_zone & ~blue & ~green
-
-    masks["Argiles / limons / tufs"] = red_zone
-
-    # éviter double comptage
-    assigned = np.zeros(h.shape, dtype=bool)
-    final_masks = {}
-
-    priority = [
-        "Argiles / limons / tufs",
-        "Marnes et argiles marneuses",
-        "Grès",
-        "Basaltes",
-        "Schistes sains"
-    ]
-
-    for name in priority:
-        final_masks[name] = masks[name] & ~assigned
-        assigned |= final_masks[name]
-
-    total = sum(int(m.sum()) for m in final_masks.values())
+def calculate_percentages(img, colors, names, tolerance):
+    arr = np.array(img.convert("RGB")).astype(int)
+    assigned = np.zeros(arr.shape[:2], dtype=bool)
 
     rows = []
 
-    for name, mask in final_masks.items():
+    for color, name in zip(colors, names):
+        color = np.array(color).astype(int)
+        dist = rgb_distance(arr, color)
+        mask = (dist <= tolerance) & (~assigned)
+
         pixels = int(mask.sum())
-        pct = round(pixels / total * 100, 2) if total else 0
+        assigned |= mask
 
         rows.append({
             "Formation": name,
-            "Pixels": pixels,
-            "Pourcentage (%)": pct
+            "RGB": tuple(color.tolist()),
+            "Pixels": pixels
         })
 
-    return pd.DataFrame(rows).sort_values("Pourcentage (%)", ascending=False), final_masks
+    total = sum(r["Pixels"] for r in rows)
 
+    for r in rows:
+        r["Pourcentage (%)"] = round(r["Pixels"] / total * 100, 2) if total else 0
 
-def overlay_result(img, masks):
-    arr = np.array(img).copy()
-
-    colors = {
-        "Basaltes": [165, 85, 0],
-        "Grès": [255, 255, 0],
-        "Marnes et argiles marneuses": [255, 80, 255],
-        "Schistes sains": [130, 130, 130],
-        "Argiles / limons / tufs": [255, 0, 0]
-    }
-
-    out = arr.copy()
-
-    for name, mask in masks.items():
-        color = np.array(colors[name])
-        out[mask] = (out[mask] * 0.35 + color * 0.65).astype(np.uint8)
-
-    return Image.fromarray(out)
-
-
-uploaded = st.file_uploader(
-    "Importer l’image nettoyée du déblai",
-    type=["png", "jpg", "jpeg"]
-)
+    return pd.DataFrame(rows).sort_values("Pourcentage (%)", ascending=False)
 
 if uploaded:
-    img = load_image(uploaded)
+    img = Image.open(uploaded).convert("RGB")
+    w, h = img.size
 
-    st.image(img, caption="Image importée", use_container_width=True)
+    st.image(img, caption="Image originale", use_container_width=True)
 
-    if st.button("Calculer"):
-        df, masks = classify_pixels(img)
+    st.subheader("1. Découper la zone utile")
 
-        st.success("Calcul terminé ✔️")
-        st.dataframe(df)
+    x1 = st.slider("X début", 0, w, 0)
+    x2 = st.slider("X fin", 0, w, w)
+    y1 = st.slider("Y début", 0, h, 0)
+    y2 = st.slider("Y fin", 0, h, h)
 
-        st.image(
-            overlay_result(img, masks),
-            caption="Pixels classés par formation",
-            use_container_width=True
-        )
+    cropped = crop_image(img, x1, x2, y1, y2)
+    st.image(cropped, caption="Zone analysée", use_container_width=True)
 
-        output = BytesIO()
+    st.subheader("2. Détection des couleurs")
 
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Pourcentages", index=False)
+    n_colors = st.slider("Nombre de formations/couleurs", 2, 10, 5)
+    tolerance = st.slider("Tolérance couleur", 10, 100, 35)
 
-        output.seek(0)
+    if st.button("Détecter les couleurs"):
+        st.session_state.colors = get_dominant_colors(cropped, n_colors)
 
-        st.download_button(
-            "📥 Télécharger Excel",
-            data=output,
-            file_name="pourcentage_formations.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    if "colors" in st.session_state:
+        names = []
+
+        for i, color in enumerate(st.session_state.colors):
+            col1, col2 = st.columns([1, 4])
+
+            with col1:
+                color_img = np.zeros((60, 120, 3), dtype=np.uint8)
+                color_img[:, :] = color
+                st.image(color_img)
+
+            with col2:
+                name = st.text_input(f"Nom formation {i+1}", value=f"Formation_{i+1}")
+                names.append(name)
+
+        if st.button("Calculer les pourcentages"):
+            df = calculate_percentages(cropped, st.session_state.colors, names, tolerance)
+
+            st.success("Calcul terminé ✔️")
+            st.dataframe(df)
+
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Pourcentages", index=False)
+
+            output.seek(0)
+
+            st.download_button(
+                "📥 Télécharger Excel",
+                data=output,
+                file_name="pourcentage_formations.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
