@@ -3,83 +3,18 @@ import numpy as np
 import pandas as pd
 import cv2
 from PIL import Image
-from pdf2image import convert_from_bytes
 from io import BytesIO
 
 
-st.set_page_config(page_title="Formations en déblai", page_icon="📊")
-st.title("📊 Pourcentage des formations en déblai")
+st.set_page_config(page_title="Pourcentage formations", page_icon="📊")
+st.title("📊 Pourcentage des formations dans le déblai")
 
 
 def load_image(file):
-    data = file.read()
-    name = file.name.lower()
-
-    if name.endswith(".pdf"):
-        return convert_from_bytes(data, dpi=250)[0].convert("RGB")
-
-    return Image.open(BytesIO(data)).convert("RGB")
+    return Image.open(file).convert("RGB")
 
 
-def hex_to_rgb(hex_color):
-    return tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
-
-
-def color_mask_rgb(img, rgb, tolerance):
-    arr = np.array(img).astype(np.int16)
-    target = np.array(rgb).astype(np.int16)
-    dist = np.sqrt(np.sum((arr - target) ** 2, axis=2))
-    return (dist <= tolerance).astype(np.uint8) * 255
-
-
-def line_y_by_x(mask):
-    h, w = mask.shape
-    y_line = np.full(w, -1, dtype=int)
-
-    for x in range(w):
-        ys = np.where(mask[:, x] > 0)[0]
-        if len(ys) > 0:
-            y_line[x] = int(np.median(ys))
-
-    valid = y_line >= 0
-
-    if valid.sum() < 20:
-        return y_line
-
-    return np.interp(
-        np.arange(w),
-        np.where(valid)[0],
-        y_line[valid]
-    ).astype(int)
-
-
-def build_deblai_mask(img, project_rgb, tn_rgb, tol_project, tol_tn):
-    arr = np.array(img)
-    h, w = arr.shape[:2]
-
-    project_mask = color_mask_rgb(img, project_rgb, tol_project)
-    tn_mask = color_mask_rgb(img, tn_rgb, tol_tn)
-
-    kernel = np.ones((5, 5), np.uint8)
-    project_mask = cv2.morphologyEx(project_mask, cv2.MORPH_CLOSE, kernel)
-    tn_mask = cv2.morphologyEx(tn_mask, cv2.MORPH_CLOSE, kernel)
-
-    y_project = line_y_by_x(project_mask)
-    y_tn = line_y_by_x(tn_mask)
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-
-    for x in range(w):
-        yp = y_project[x]
-        yt = y_tn[x]
-
-        if yp > 0 and yt > 0 and yt < yp:
-            mask[yt:yp, x] = 255
-
-    return mask
-
-
-def classify_formations(img, deblai_mask):
+def classify_pixels(img):
     arr = np.array(img)
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
 
@@ -87,42 +22,89 @@ def classify_formations(img, deblai_mask):
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
 
-    zone = deblai_mask > 0
-    assigned = np.zeros(zone.shape, dtype=bool)
+    # ignorer fond sombre, blanc, traits fins
+    valid = (v > 40) & (s > 40)
+
+    # ignorer bleu ligne projet
+    blue = (h >= 95) & (h <= 135) & (s > 60)
+
+    # ignorer vert TN
+    green = (h >= 40) & (h <= 90) & (s > 60)
+
+    valid = valid & ~blue & ~green
 
     masks = {}
 
-    # Rouge hachuré : argiles / limons / tufs
-    red = zone & (((h <= 8) | (h >= 170)) & (s > 70) & (v > 40))
-    red = cv2.dilate(red.astype(np.uint8), np.ones((9, 9), np.uint8), iterations=2) > 0
-    red = cv2.bitwise_and(red.astype(np.uint8), zone.astype(np.uint8)).astype(bool)
-    masks["Argiles / limons / tufs"] = red
-    assigned |= red
+    # Marron = basaltes
+    masks["Basaltes"] = (
+        valid &
+        (h >= 5) & (h <= 25) &
+        (s > 80) &
+        (v > 45) & (v < 210)
+    )
 
-    # Rose : marnes
-    pink = zone & ~assigned & (h >= 135) & (h <= 165) & (s > 50) & (v > 90)
-    masks["Marnes et argiles marneuses"] = pink
-    assigned |= pink
+    # Jaune = grès
+    masks["Grès"] = (
+        valid &
+        (h >= 22) & (h <= 38) &
+        (s > 80) &
+        (v > 120)
+    )
 
-    # Jaune : grès
-    yellow = zone & ~assigned & (h >= 22) & (h <= 38) & (s > 80) & (v > 120)
-    masks["Grès"] = yellow
-    assigned |= yellow
+    # Rose = marnes
+    masks["Marnes et argiles marneuses"] = (
+        valid &
+        (h >= 135) & (h <= 165) &
+        (s > 50) &
+        (v > 90)
+    )
 
-    # Marron : basaltes
-    brown = zone & ~assigned & (h >= 8) & (h <= 25) & (s > 80) & (v > 40) & (v < 210)
-    masks["Basaltes"] = brown
-    assigned |= brown
+    # Gris = schistes sains
+    masks["Schistes sains"] = (
+        (v > 60) & (v < 190) &
+        (s < 45)
+    )
 
-    # Gris : schistes sains
-    gray = zone & ~assigned & (s < 45) & (v > 50) & (v < 190)
-    masks["Schistes sains"] = gray
-    assigned |= gray
+    # Rouge hachuré = argiles / limons / tufs
+    red_lines = (
+        valid &
+        (((h <= 8) | (h >= 170)) &
+        (s > 70) &
+        (v > 50))
+    )
+
+    # épaissir les hachures rouges pour représenter la zone hachurée
+    red_zone = cv2.dilate(
+        red_lines.astype(np.uint8),
+        np.ones((11, 11), np.uint8),
+        iterations=2
+    ).astype(bool)
+
+    red_zone = red_zone & ~blue & ~green
+
+    masks["Argiles / limons / tufs"] = red_zone
+
+    # éviter double comptage
+    assigned = np.zeros(h.shape, dtype=bool)
+    final_masks = {}
+
+    priority = [
+        "Argiles / limons / tufs",
+        "Marnes et argiles marneuses",
+        "Grès",
+        "Basaltes",
+        "Schistes sains"
+    ]
+
+    for name in priority:
+        final_masks[name] = masks[name] & ~assigned
+        assigned |= final_masks[name]
+
+    total = sum(int(m.sum()) for m in final_masks.values())
 
     rows = []
-    total = sum(int(m.sum()) for m in masks.values())
 
-    for name, mask in masks.items():
+    for name, mask in final_masks.items():
         pixels = int(mask.sum())
         pct = round(pixels / total * 100, 2) if total else 0
 
@@ -132,40 +114,33 @@ def classify_formations(img, deblai_mask):
             "Pourcentage (%)": pct
         })
 
-    return pd.DataFrame(rows).sort_values("Pourcentage (%)", ascending=False), masks
+    return pd.DataFrame(rows).sort_values("Pourcentage (%)", ascending=False), final_masks
 
 
-def make_overlay(img, deblai_mask):
+def overlay_result(img, masks):
     arr = np.array(img).copy()
-    overlay = arr.copy()
 
-    zone = deblai_mask > 0
-    overlay[zone] = (
-        overlay[zone] * 0.45 + np.array([255, 255, 0]) * 0.55
-    ).astype(np.uint8)
+    colors = {
+        "Basaltes": [165, 85, 0],
+        "Grès": [255, 255, 0],
+        "Marnes et argiles marneuses": [255, 80, 255],
+        "Schistes sains": [130, 130, 130],
+        "Argiles / limons / tufs": [255, 0, 0]
+    }
 
-    return Image.fromarray(overlay)
+    out = arr.copy()
+
+    for name, mask in masks.items():
+        color = np.array(colors[name])
+        out[mask] = (out[mask] * 0.35 + color * 0.65).astype(np.uint8)
+
+    return Image.fromarray(out)
 
 
 uploaded = st.file_uploader(
-    "Importer le profil découpé",
-    type=["png", "jpg", "jpeg", "pdf"]
+    "Importer l’image nettoyée du déblai",
+    type=["png", "jpg", "jpeg"]
 )
-
-st.sidebar.header("Paramètres")
-
-project_color = st.sidebar.color_picker(
-    "Couleur ligne projet",
-    value="#0000ff"
-)
-
-tn_color = st.sidebar.color_picker(
-    "Couleur TN",
-    value="#00ff00"
-)
-
-tol_project = st.sidebar.slider("Tolérance ligne projet", 5, 120, 45)
-tol_tn = st.sidebar.slider("Tolérance TN", 5, 120, 45)
 
 if uploaded:
     img = load_image(uploaded)
@@ -173,38 +148,27 @@ if uploaded:
     st.image(img, caption="Image importée", use_container_width=True)
 
     if st.button("Calculer"):
-        deblai_mask = build_deblai_mask(
-            img,
-            hex_to_rgb(project_color),
-            hex_to_rgb(tn_color),
-            tol_project,
-            tol_tn
+        df, masks = classify_pixels(img)
+
+        st.success("Calcul terminé ✔️")
+        st.dataframe(df)
+
+        st.image(
+            overlay_result(img, masks),
+            caption="Pixels classés par formation",
+            use_container_width=True
         )
 
-        if deblai_mask.sum() == 0:
-            st.error("Zone déblai non détectée. Vérifie couleur ligne projet et TN.")
-        else:
-            df, masks = classify_formations(img, deblai_mask)
+        output = BytesIO()
 
-            st.success("Calcul terminé ✔️")
-            st.dataframe(df)
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Pourcentages", index=False)
 
-            st.image(
-                make_overlay(img, deblai_mask),
-                caption="Zone analysée : entre TN vert et ligne projet",
-                use_container_width=True
-            )
+        output.seek(0)
 
-            output = BytesIO()
-
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name="Formations_deblai", index=False)
-
-            output.seek(0)
-
-            st.download_button(
-                "📥 Télécharger Excel",
-                data=output,
-                file_name="pourcentage_formations_deblai.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        st.download_button(
+            "📥 Télécharger Excel",
+            data=output,
+            file_name="pourcentage_formations.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
